@@ -200,12 +200,16 @@ def return_optimised_posterior(data: gpjax.Dataset, prior: gpjax.gps.Prior, key)
 
     return opt_posterior
 
-def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upper_bound, num_samples=20):
+def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upper_bound, num_samples, num_initial_sample_points):
     def apply_fn(sample_func, x_data):
         return sample_func(x_data)
 
     def create_path(xs, ys):
         return ExPath(jnp.squeeze(xs, axis=-2), jnp.squeeze(ys, axis=-2))
+
+    key, _key = jr.split(key)
+    initial_sample_points = jr.uniform(_key, shape=(num_initial_sample_points, lower_bound.shape[0]), dtype=jnp.float64,
+                                       minval=lower_bound, maxval=upper_bound)
 
     def outer_loop(key):
         sample_func_list = []
@@ -235,9 +239,16 @@ def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upp
         sample_stds = []
         for gp_idx, posterior in enumerate(optimized_posteriors):
             comb_x = jnp.concatenate((D.X, exe_path.x))
-            comb_y = jnp.concatenate((jnp.expand_dims(D.y[:, gp_idx], axis=-1), exe_path.y))
+            comb_y = jnp.concatenate((jnp.expand_dims(D.y[:, gp_idx], axis=-1), jnp.expand_dims(exe_path.y[:, gp_idx], axis=-1)))
 
-        return all_xs, all_ys, exe_path
+            data = gpjax.Dataset(X=comb_x, y=comb_y)
+            latent_dist = posterior.predict(initial_sample_points, train_data=data)
+            predictive_dist = posterior.likelihood(latent_dist)
+
+            sample_mus.append(predictive_dist.mean())  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
+            sample_stds.append(predictive_dist.stddev())
+
+        return all_xs, all_ys, exe_path, jnp.array(sample_mus), jnp.array(sample_stds)
 
     # Create initial state for all samples
     init_x = jnp.array([[0.5, 0.5]])
@@ -245,34 +256,35 @@ def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upp
 
     key, _key = jrandom.split(key)
     batch_key = jrandom.split(key, num_samples)
-    all_xs, all_ys, exe_path = jax.vmap(outer_loop)(batch_key)
+    all_xs, all_ys, exe_path, sample_mus, sample_stds = jax.vmap(outer_loop)(batch_key)
 
-    return exe_path
+    return exe_path, initial_sample_points, sample_mus, sample_stds
 
-def optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path_x, exe_path_y, num_initial_sample_points):
-    key, _key = jr.split(key)
-    initial_sample_points = jr.uniform(_key, shape=(num_initial_sample_points, lower_bound.shape[0]), dtype=jnp.float64,
-                                       minval=lower_bound, maxval=upper_bound)
+# def optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path_x, exe_path_y, num_initial_sample_points):
+def optimise_sample(optimized_posteriors, D, initial_sample_points, sample_mus, sample_stds):
+    # key, _key = jr.split(key)
+    # initial_sample_points = jr.uniform(_key, shape=(num_initial_sample_points, lower_bound.shape[0]), dtype=jnp.float64,
+    #                                    minval=lower_bound, maxval=upper_bound)
 
     # the acquisting function thing is here
     predictive_mus = []
     predictive_stds = []
-    sample_mus = []
-    sample_stds = []
-
-    # TODO can we vmap this?
-    def test_vmap(collected_data_x, collected_data_y, exe_path_x, exe_path_y, posterior, initial_sample_points):
-        comb_x = jnp.concatenate((collected_data_x, exe_path_x))
-        comb_y = jnp.concatenate((collected_data_y, exe_path_y))
-
-        data = gpjax.Dataset(X=comb_x, y=comb_y)
-        latent_dist = posterior.predict(initial_sample_points, train_data=data)
-        predictive_dist = posterior.likelihood(latent_dist)
-
-        sample_mean = predictive_dist.mean()  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-        sample_std = predictive_dist.stddev()
-
-        return sample_mean, sample_std
+    # sample_mus = []
+    # sample_stds = []
+    #
+    # # TODO can we vmap this?
+    # def test_vmap(collected_data_x, collected_data_y, exe_path_x, exe_path_y, posterior, initial_sample_points):
+    #     comb_x = jnp.concatenate((collected_data_x, exe_path_x))
+    #     comb_y = jnp.concatenate((collected_data_y, exe_path_y))
+    #
+    #     data = gpjax.Dataset(X=comb_x, y=comb_y)
+    #     latent_dist = posterior.predict(initial_sample_points, train_data=data)
+    #     predictive_dist = posterior.likelihood(latent_dist)
+    #
+    #     sample_mean = predictive_dist.mean()  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
+    #     sample_std = predictive_dist.stddev()
+    #
+    #     return sample_mean, sample_std
 
     for gp_idx, posterior in enumerate(optimized_posteriors):
         data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
@@ -284,17 +296,17 @@ def optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_
         predictive_mus.append(predictive_mean)
         predictive_stds.append(predictive_std)
 
-        sample_mean, sample_std = jax.vmap(test_vmap, in_axes=(None, None, 0, 0, None, None))(D.X, jnp.expand_dims(
-            D.y[:, gp_idx], axis=-1), exe_path_x, jnp.expand_dims(exe_path_y[:, :, gp_idx], axis=-1), posterior,
-                                                                                              initial_sample_points)
-        sample_mus.append(sample_mean)
-        sample_stds.append(sample_std)
+        # sample_mean, sample_std = jax.vmap(test_vmap, in_axes=(None, None, 0, 0, None, None))(D.X, jnp.expand_dims(
+        #     D.y[:, gp_idx], axis=-1), exe_path_x, jnp.expand_dims(exe_path_y[:, :, gp_idx], axis=-1), posterior,
+        #                                                                                       initial_sample_points)
+        # sample_mus.append(sample_mean)
+        # sample_stds.append(sample_std)
 
     def acq_exe_normal(predictive, sample):
         def entropy_given_normal_std_list(std_list):
             return jnp.log(std_list) + jnp.log(jnp.sqrt(2 * jnp.pi)) + 0.5  # TODO check if correct std or var
         h_post = jnp.sum(entropy_given_normal_std_list(jnp.array(predictive)), axis=0)
-        h_sample = jnp.mean(jnp.sum(entropy_given_normal_std_list(jnp.array(sample)), axis=0), axis=0)
+        h_sample = jnp.mean(jnp.sum(entropy_given_normal_std_list(sample), axis=1), axis=0)
         acq_exe = h_post - h_sample
 
         return acq_exe
@@ -320,6 +332,8 @@ lower_bound = jnp.array([domain[0][0], domain[1][0]])
 upper_bound = jnp.array([domain[0][1], domain[1][1]])
 n_init_data = 1
 bo_iters = 25
+num_samples = 20
+num_initial_sample_points = 1000
 
 init_x = jnp.array(unif_random_sample_domain(domain, n_init_data))
 init_y = jnp.array([step_northwest(xi) for xi in init_x])
@@ -342,11 +356,10 @@ for i in range(bo_iters):
     # Sample from posteriors and find minimizer
     key, _key = jr.split(key)
     ind_time = time.time()
-    exe_path = sample_and_optimize_posterior(optimized_posteriors, D, _key, lower_bound, upper_bound)  # TODO is it potentialy quicker and more efficient to just sample from the posterior likelihood and vmap across this?
+    exe_path, initial_sample_points, sample_mus, sample_stds = sample_and_optimize_posterior(optimized_posteriors, D, _key, lower_bound, upper_bound, num_samples, num_initial_sample_points)  # TODO is it potentialy quicker and more efficient to just sample from the posterior likelihood and vmap across this?
     print(f"{time.time() - ind_time} - Exe path time taken")
     ind_time = time.time()
-    x_star = optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x, exe_path.y,
-                                  num_initial_sample_points=1000)
+    x_star = optimise_sample(optimized_posteriors, D, initial_sample_points, sample_mus, sample_stds)
     print(f"{time.time() - ind_time} - Optimisation time taken")
     y_star = f([x_star[0], x_star[1]])
     print(f"BO Iteration: {i + 1}, Queried Point: {x_star}, Black-Box Function Value:" f" {y_star}")
