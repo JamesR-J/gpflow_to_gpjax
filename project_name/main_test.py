@@ -201,49 +201,53 @@ def return_optimised_posterior(data: gpjax.Dataset, prior: gpjax.gps.Prior, key)
     return opt_posterior
 
 def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upper_bound, num_samples=20):
-    def apply_sample_func(posterior, gp_idx, sample_key, x):
-        data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
-        sample_func = posterior.sample_approx(num_samples=1, train_data=data, key=sample_key, num_features=500)
-        return sample_func(x)
+    def apply_fn(sample_func, x_data):
+        return sample_func(x_data)
 
-    def step_fn(carry, _):
-        x, sample_keys = carry
+    def create_path(xs, ys):
+        return ExPath(jnp.squeeze(xs, axis=-2), jnp.squeeze(ys, axis=-2))
 
-        predictions = []
+    def outer_loop(key):
+        sample_func_list = []
         for gp_idx, posterior in enumerate(optimized_posteriors):
-            y = apply_sample_func(posterior, gp_idx, sample_keys[gp_idx], x)
-            predictions.append(y)
+            data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
+            key, _key = jrandom.split(key)
+            sample_func = posterior.sample_approx(num_samples=1, train_data=data, key=_key, num_features=500)
+            sample_func_list.append(sample_func)
 
-        y_tot = jnp.concatenate(predictions, axis=-1)
+        def _step_fn(this_x, _):
+            predictions = []
+            for sample_func in sample_func_list:
+                y = apply_fn(sample_func, this_x)
+                predictions.append(y)
 
-        next_x = jnp.clip(x + y_tot, jnp.array([domain[0][0], domain[1][0]]), jnp.array([domain[0][1], domain[1][1]]))
+            y_tot = jnp.concatenate(predictions, axis=-1)
 
-        return (next_x, sample_keys), (x, y_tot)
+            next_x = jnp.clip(this_x + y_tot, jnp.array([domain[0][0], domain[1][0]]), jnp.array([domain[0][1], domain[1][1]]))
 
-    vmapped_step_fn = jax.vmap(step_fn, in_axes=(0, None), out_axes=(0, 0))
+            return next_x, (this_x, y_tot)
 
-    num_gps = len(optimized_posteriors)
-    key, subkey = jrandom.split(key)
-    all_keys = jrandom.split(subkey, num_samples * num_gps)
-    sample_keys = all_keys.reshape((num_samples, num_gps, 2))
+        _, (all_xs, all_ys) = jax.lax.scan(_step_fn, init_x, None, length=40)
+
+        exe_path = create_path(all_xs, all_ys)
+
+        sample_mus = []
+        sample_stds = []
+        for gp_idx, posterior in enumerate(optimized_posteriors):
+            comb_x = jnp.concatenate((D.X, exe_path.x))
+            comb_y = jnp.concatenate((jnp.expand_dims(D.y[:, gp_idx], axis=-1), exe_path.y))
+
+        return all_xs, all_ys, exe_path
 
     # Create initial state for all samples
     init_x = jnp.array([[0.5, 0.5]])
-    init_xs = jnp.tile(init_x, (num_samples, 1, 1))
+    # init_xs = jnp.tile(init_x, (num_samples, 1, 1))
 
-    # Set up the scan to run for 40 steps
-    init_carry = (init_xs, jnp.array(sample_keys))
-    (_, _), (all_xs, all_ys) = jax.lax.scan(lambda c, _: vmapped_step_fn(c, None), init_carry, None, length=40)
+    key, _key = jrandom.split(key)
+    batch_key = jrandom.split(key, num_samples)
+    all_xs, all_ys, exe_path = jax.vmap(outer_loop)(batch_key)
 
-    def create_path(xs, ys):
-        return ExPath(jnp.squeeze(xs, axis=1), jnp.squeeze(ys, axis=1))
-
-    all_paths = jax.vmap(create_path)(all_xs, all_ys)
-    exe_path = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), all_paths)
-
-    x_star_list = optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x, exe_path.y,
-                                  num_initial_sample_points=1000)
-    return x_star_list, exe_path.x
+    return exe_path
 
 def optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path_x, exe_path_y, num_initial_sample_points):
     key, _key = jr.split(key)
@@ -281,7 +285,7 @@ def optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_
         predictive_stds.append(predictive_std)
 
         sample_mean, sample_std = jax.vmap(test_vmap, in_axes=(None, None, 0, 0, None, None))(D.X, jnp.expand_dims(
-            D.y[:, gp_idx], axis=-1), exe_path_x, np.expand_dims(exe_path_y[:, :, gp_idx], axis=-1), posterior,
+            D.y[:, gp_idx], axis=-1), exe_path_x, jnp.expand_dims(exe_path_y[:, :, gp_idx], axis=-1), posterior,
                                                                                               initial_sample_points)
         sample_mus.append(sample_mean)
         sample_stds.append(sample_std)
@@ -337,7 +341,13 @@ for i in range(bo_iters):
 
     # Sample from posteriors and find minimizer
     key, _key = jr.split(key)
-    x_star, exe_path_list = sample_and_optimize_posterior(optimized_posteriors, D, _key, lower_bound, upper_bound)
+    ind_time = time.time()
+    exe_path = sample_and_optimize_posterior(optimized_posteriors, D, _key, lower_bound, upper_bound)  # TODO is it potentialy quicker and more efficient to just sample from the posterior likelihood and vmap across this?
+    print(f"{time.time() - ind_time} - Exe path time taken")
+    ind_time = time.time()
+    x_star = optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x, exe_path.y,
+                                  num_initial_sample_points=1000)
+    print(f"{time.time() - ind_time} - Optimisation time taken")
     y_star = f([x_star[0], x_star[1]])
     print(f"BO Iteration: {i + 1}, Queried Point: {x_star}, Black-Box Function Value:" f" {y_star}")
 
@@ -348,7 +358,7 @@ for i in range(bo_iters):
 
     # Plot true path and posterior path samples
     plot_path_2d(true_path, ax, true_path=True)
-    for path in exe_path_list:
+    for path in exe_path.x:
         plot_path_2d_jax(path, ax)
 
     # Plot observations
