@@ -43,6 +43,7 @@ from gpjax.typing import (
 import neatplot
 from typing import NamedTuple
 import numpy as np
+import time
 
 config.update("jax_enable_x64", True)
 
@@ -204,73 +205,84 @@ def return_optimised_posterior(data: gpjax.Dataset, prior: gpjax.gps.Prior, key)
 
 def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upper_bound, num_samples=20):
     """Sample from posteriors and optimize."""
-    samples = []
-    for gp_idx, posterior in enumerate(optimized_posteriors):
-        key, _key = jr.split(key)
-        data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
-        sample_SB = posterior.sample_approx(num_samples=1, train_data=data, key=_key, num_features=500)
-        samples.append(sample_SB)
-
-    # do it for 40 steps
-    def _create_exe_path(x_init_NO, unused):  # TODO THIS DOES NOTHING AS THE SAME SAMPLES ARE USED BUT WITH MORE POINTS
-        y_1_NB = samples[0](x_init_NO)
-        y_2_NB = samples[1](x_init_NO)
-
-        y_tot_NO = jnp.concatenate((y_1_NB, y_2_NB), axis=-1)
-
-        next_x_NO = x_init_NO + y_tot_NO  # TODO still only does one step predictions can we draw multi-step samples quickly using pathwise stuff? I guess not as GP is homoskedastic?
-        next_x = jnp.clip(next_x_NO, jnp.array((domain[0][0], domain[1][0])), jnp.array((domain[0][1], domain[1][1])))
-        path = ExPath(x_init_NO, y_tot_NO)
-
-        return next_x, path
-
-    init_x = jnp.tile(jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0), (num_samples, 1))
-    # init_x = jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0)
-    _, exe_path = jax.lax.scan(_create_exe_path, init_x, None, 40)
-    exe_path = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), exe_path)
-    # TODO again dodgy above, should try to fix so that num_samples from posterior is actuallly used
-
-    x_star_list = optimise_sample(samples, optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x,
-                                  exe_path.y, num_initial_sample_points=1000)
-    return x_star_list, exe_path.x
-
-def sample_and_optimize_posterior_unsure(optimized_posteriors, D, key, lower_bound, upper_bound, num_samples=20):
-    """Sample from posteriors and optimize."""
-    samples = []
-    for gp_idx, posterior in enumerate(optimized_posteriors):
-        key, _key = jr.split(key)
-        data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
-        sample_SB = posterior.sample_approx(num_samples=num_samples, train_data=data, key=_key, num_features=500)
-        samples.append(sample_SB)
-
-    def _multisample_exe_path(init_x, curr_samples):
-        def _create_exe_path(x_init, unused):  # TODO should we use samples or something else for this even?
-            y_1_SB = curr_samples[0](x_init)
-            y_2_SB = curr_samples[1](x_init)
-
-            y_tot = jnp.concatenate((y_1_SB, y_2_SB),
-                                    axis=-1)  # TODO this is dodge as it goes from SB to B1 but if S is > 1 then it not good
-
-            next_x = x_init + y_tot  # TODO still only does one step predictions can we draw multi-step samples quickly using pathwise stuff? I guess not as GP is homoskedastic?
-            next_x = jnp.clip(next_x, jnp.array((domain[0][0], domain[1][0])), jnp.array((domain[0][1], domain[1][1])))
-            path = ExPath(jnp.squeeze(x_init, axis=0), jnp.squeeze(y_tot, axis=0))
-
-            return next_x, path
-
-        _, exe_path = jax.lax.scan(_create_exe_path, init_x, None, 40)
-
-        return exe_path
-
+    # samples = []
+    # for gp_idx, posterior in enumerate(optimized_posteriors):
+    #     key, _key = jr.split(key)
+    #     data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
+    #     sample_func = posterior.sample_approx(num_samples=num_samples, train_data=data, key=_key, num_features=500)
+    #     samples.append(sample_func)
+    #
+    # # do it for 40 steps
+    # def _env_step(x_init_O, unused):
+    #     x_init_1O = jnp.expand_dims(x_init_O, axis=0)
+    #     y_1_NB = samples[0](x_init_1O)
+    #     y_2_NB = samples[1](x_init_1O)
+    #
+    #     y_tot_1O = jnp.concatenate((y_1_NB, y_2_NB), axis=-1)
+    #
+    #     next_x_1O = x_init_1O + y_tot_1O  # TODO still only does one step predictions can we draw multi-step samples quickly using pathwise stuff? I guess not as GP is homoskedastic?
+    #     next_x_1O = jnp.clip(next_x_1O, jnp.array((domain[0][0], domain[1][0])), jnp.array((domain[0][1], domain[1][1])))
+    #     path = ExPath(x_init_1O, y_tot_1O)
+    #
+    #     return jnp.squeeze(next_x_1O, axis=0), path
+    #
+    # vmapped_step = jax.vmap(_env_step, in_axes=(0, None), out_axes=0)
+    #
+    # def _create_exe_path(positions, unused):
+    #     next_positions, path_info = vmapped_step(positions, None)
+    #     return next_positions, path_info
+    #
     # init_x = jnp.tile(jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0), (num_samples, 1))
-    init_x = jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0)
-    multisample_exe_path = jax.vmap(_multisample_exe_path, in_axes=(None, 0))(init_x, samples[0])
+    # # init_x = jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0)
+    # _, exe_path = jax.lax.scan(_create_exe_path, init_x, None, 40)
+    # exe_path = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), exe_path)
 
+    # Function to apply a sample function at a specific point
+    def apply_sample_func(posterior, gp_idx, sample_key, x):
+        data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
+        sample_func = posterior.sample_approx(num_samples=1, train_data=data, key=sample_key, num_features=500)
+        return sample_func(x)
 
-    x_star_list = optimise_sample(samples, optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x,
-                                  exe_path.y, num_initial_sample_points=1000)
+    def step_fn(carry, _):
+        x, sample_keys = carry
+
+        predictions = []
+        for gp_idx, posterior in enumerate(optimized_posteriors):
+            y = apply_sample_func(posterior, gp_idx, sample_keys[gp_idx], x)
+            predictions.append(y)
+
+        y_tot = jnp.concatenate(predictions, axis=-1)
+
+        next_x = jnp.clip(x + y_tot, jnp.array([domain[0][0], domain[1][0]]), jnp.array([domain[0][1], domain[1][1]]))
+
+        return (next_x, sample_keys), (x, y_tot)
+
+    vmapped_step_fn = jax.vmap(step_fn, in_axes=(0, None), out_axes=(0, 0))
+
+    num_gps = len(optimized_posteriors)
+    key, subkey = jrandom.split(key)
+    all_keys = jrandom.split(subkey, num_samples * num_gps)
+    sample_keys = all_keys.reshape((num_samples, num_gps, 2))
+
+    # Create initial state for all samples
+    init_x = jnp.array([[0.5, 0.5]])
+    init_xs = jnp.tile(init_x, (num_samples, 1, 1))
+
+    # Set up the scan to run for 40 steps
+    init_carry = (init_xs, jnp.array(sample_keys))
+    (_, _), (all_xs, all_ys) = jax.lax.scan(lambda c, _: vmapped_step_fn(c, None), init_carry, None, length=40)
+
+    def create_path(xs, ys):
+        return ExPath(jnp.squeeze(xs, axis=1), jnp.squeeze(ys, axis=1))
+
+    all_paths = jax.vmap(create_path)(all_xs, all_ys)
+    exe_path = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), all_paths)
+
+    x_star_list = optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x, exe_path.y,
+                                  num_initial_sample_points=1000)
     return x_star_list, exe_path.x
 
-def optimise_sample(sample, optimized_posteriors, D, key, lower_bound, upper_bound, exe_path_x, exe_path_y, num_initial_sample_points):
+def optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path_x, exe_path_y, num_initial_sample_points):
     key, _key = jr.split(key)
     initial_sample_points = jr.uniform(_key, shape=(num_initial_sample_points, lower_bound.shape[0]), dtype=jnp.float64,
                                        minval=lower_bound, maxval=upper_bound)
@@ -362,6 +374,7 @@ D = gpjax.Dataset(X=init_x, y=init_y)
 output_dims = 2  # TODO can change this for later
 gp_models = create_gp_models(output_dims)
 
+start_time = time.time()
 for i in range(bo_iters):
     print("---" * 5 + f" Start iteration i={i} " + "---" * 5)
     # Generate optimised posterior
@@ -400,9 +413,4 @@ for i in range(bo_iters):
     if save_figure:
         neatplot.save_figure(f"bax_multi_new{i}", "png")
 
-
-
-
-
-
-
+print(time.time() - start_time)
