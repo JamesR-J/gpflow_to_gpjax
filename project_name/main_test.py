@@ -19,7 +19,8 @@ from typing import (
 import jax
 
 # Enable Float64 for more stable matrix inversions.
-from jax import config
+from jax import config, hessian
+from dataclasses import dataclass, field
 import jax.numpy as jnp
 import jax.random as jr
 from jaxopt import ScipyBoundedMinimize
@@ -43,6 +44,8 @@ from gpjax.typing import (
 import neatplot
 from typing import NamedTuple
 import numpy as np
+from gpjax.kernels.computations import DenseKernelComputation
+import pandas as pd
 
 config.update("jax_enable_x64", True)
 
@@ -176,40 +179,147 @@ multi_gp_params = {"n_dimy": 2, "gp_params": gp_params}
 true_algo = algo_class(algo_params)
 true_path, _ = algo.run_algorithm_on_f(f)
 
-def create_gp_models(output_dims):  # TODO can we vmap this ever?
-    """Create multiple single-output GP models."""
-    gps = []
-    for _ in range(output_dims):
-        mean = gpjax.mean_functions.Zero()
-        kernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0)  # TODO make this more general
-        prior = gpjax.gps.Prior(mean_function=mean, kernel=kernel)
-        gps.append(prior)
-    return gps
 
-def return_optimised_posterior(data: gpjax.Dataset, prior: gpjax.gps.Prior, key) -> gpjax.gps.AbstractPosterior:
-    # Our function is noise-free, so we set the observation noise's standard deviation to a very small value
-    likelihood = gpjax.likelihoods.Gaussian(num_datapoints=data.n, obs_stddev=Static(jnp.array(1e-6)))
-    posterior = prior * likelihood
-    opt_posterior, _ = gpjax.fit(model=posterior,
-                                 objective=lambda p, d: -gpjax.objectives.conjugate_mll(p, d),
-                                 train_data=data,
-                                 optim=optax.adam(learning_rate=0.01),
-                                 num_iters=1000,
-                                 safe=True,
-                                 key=key,
-                                 verbose=False)
-    # TODO do we even need to optimise this?
+@dataclass
+class HelmholtzKernel(gpjax.kernels.stationary.StationaryKernel):
+    # initialise Phi and Psi kernels as any stationary kernel in gpJax
+    potential_kernel: gpjax.kernels.stationary.StationaryKernel = field(
+        default_factory=lambda: gpjax.kernels.RBF(active_dims=[0, 1])
+    )
+    stream_kernel: gpjax.kernels.stationary.StationaryKernel = field(
+        default_factory=lambda: gpjax.kernels.RBF(active_dims=[0, 1])
+    )
+    compute_engine = DenseKernelComputation()
 
-    return opt_posterior
+    def __call__(
+        self, X: Float[Array, "1 D"], Xp: Float[Array, "1 D"]
+    ) -> Float[Array, "1"]:
+        # obtain indices for k_helm, implement in the correct sign between the derivatives
+        z = jnp.array(X[2], dtype=int)
+        zp = jnp.array(Xp[2], dtype=int)
+        sign = (-1) ** (z + zp)
 
-def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upper_bound, num_samples=20):
+        # convert to array to correctly index, -ve sign due to exchange symmetry (only true for stationary kernels)
+        potential_dvtve = -jnp.array(
+            hessian(self.potential_kernel)(X, Xp), dtype=jnp.float64
+        )[z][zp]
+        stream_dvtve = -jnp.array(
+            hessian(self.stream_kernel)(X, Xp), dtype=jnp.float64
+        )[1 - z][1 - zp]
+
+        return potential_dvtve + sign * stream_dvtve
+
+
+class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed this from abstract kernel
+    def __init__(
+        self,
+        # kernel0: gpjax.kernels.AbstractKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),  # TODO the original with abstract kernels
+        # kernel1: gpjax.kernels.AbstractKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
+        kernel0: gpjax.kernels.stationary.StationaryKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
+        kernel1: gpjax.kernels.stationary.StationaryKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
+    ):
+        self.kernel0 = kernel0
+        self.kernel1 = kernel1
+        super().__init__(compute_engine=DenseKernelComputation())
+
+    def __call__(
+        self, X: Float[Array, "1 D"], Xp: Float[Array, "1 D"]) -> Float[Array, "1"]:
+        # standard RBF-SE kernel is x and x' are on the same output, otherwise returns 0
+
+        z = jnp.array(X[2], dtype=int)
+        zp = jnp.array(Xp[2], dtype=int)
+
+        # achieve the correct value via 'switches' that are either 1 or 0
+        k0_switch = ((z + 1) % 2) * ((zp + 1) % 2)
+        k1_switch = z * zp
+
+        return k0_switch * self.kernel0(X, Xp) + k1_switch * self.kernel1(X, Xp)
+
+    @property
+    def spectral_density(self) -> Float[Array, "N"]:  # TODO this is kinda dodge and idk if it works really
+        spectral0 = self.kernel0.spectral_density
+        spectral1 = self.kernel1.spectral_density
+
+        # Equal weighting of the two kernels
+        return spectral0  # 0.5 * spectral0 + 0.5 * spectral1
+
+
+def create_gp_model(output_dims):  # TODO can we vmap this ever?
+    """Create multi-output GP models."""
+    mean = gpjax.mean_functions.Zero()
+    kernel = VelocityKernel() # TODO make this more general
+    # kernel = HelmholtzKernel() # TODO make this more general
+    # kernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0)
+    prior = gpjax.gps.Prior(mean_function=mean, kernel=kernel)
+    return prior
+
+def adjust_dataset_old(data):
+    # function to place data from csv into correct array shape
+    def prepare_data(df):
+        pos = jnp.array([df["lon"], df["lat"]])
+        vel = jnp.array([df["ubar"], df["vbar"]])
+        # extract shape stored as 'metadata' in the test data
+        try:
+            shape = (int(df["shape"][1]), int(df["shape"][0]))  # shape = (34,16)
+            return pos, vel, shape
+        except KeyError:
+            return pos, vel
+
+    # loading in data
+
+    gulf_data_train = pd.read_csv(
+        "https://raw.githubusercontent.com/JaxGaussianProcesses/static/main/data/gulfdata_train.csv"
+    )
+    gulf_data_test = pd.read_csv(
+        "https://raw.githubusercontent.com/JaxGaussianProcesses/static/main/data/gulfdata_test.csv"
+    )
+
+    pos_test, vel_test, shape = prepare_data(gulf_data_test)
+    pos_train, vel_train = prepare_data(gulf_data_train)
+
+    # Change vectors x -> X = (x,z), and vectors y -> Y = (y,z) via the artificial z label
+    def label_position(data):  # 2,20
+        # introduce alternating z label
+        n_points = len(data[0])
+        label = jnp.tile(jnp.array([0.0, 1.0]), n_points)
+        return jnp.vstack((jnp.repeat(data, repeats=2, axis=1), label)).T
+
+    # change vectors y -> Y by reshaping the velocity measurements
+    def stack_velocity(data):  # 2,20
+        return data.T.flatten().reshape(-1, 1)
+
+    def dataset_3d(pos, vel):
+        return gpjax.Dataset(label_position(pos), stack_velocity(vel))
+
+    # turns 2,20 into 40,3 and 40,1
+
+    return dataset_3d(pos_train, vel_train), dataset_3d(pos_test, vel_test)
+
+def adjust_dataset(x, y):
+    # Change vectors x -> X = (x,z), and vectors y -> Y = (y,z) via the artificial z label
+    def label_position(data):  # 2,20
+        # introduce alternating z label
+        n_points = len(data[0])
+        label = jnp.tile(jnp.array([0.0, 1.0]), n_points)
+        return jnp.vstack((jnp.repeat(data, repeats=2, axis=1), label)).T
+
+    # change vectors y -> Y by reshaping the velocity measurements
+    def stack_velocity(data):  # 2,20
+        return data.T.flatten().reshape(-1, 1)
+
+    def dataset_3d(pos, vel):
+        return gpjax.Dataset(label_position(pos), stack_velocity(vel))
+
+    # takes in dimension (number of data points, num features)
+
+    return dataset_3d(jnp.swapaxes(x, 0, 1), jnp.swapaxes(y, 0, 1))
+
+def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, upper_bound, num_samples=1):
     """Sample from posteriors and optimize."""
-    samples = []
-    for gp_idx, posterior in enumerate(optimized_posteriors):
-        key, _key = jr.split(key)
-        data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
-        sample_SB = posterior.sample_approx(num_samples=1, train_data=data, key=_key, num_features=500)
-        samples.append(sample_SB)
+    key, _key = jr.split(key)
+    # TODO can do the above and vmap to get many different samples
+    # sample_SB = optimized_posterior.sample_approx(num_samples=1, train_data=D, key=_key, num_features=500)  # TODO apparently pathwise sampling does not work on non-stationary kernels
+    sample_SB = optimized_posterior.sample_approx(num_samples=1, train_data=D, key=_key)
 
     # do it for 40 steps
     def _create_exe_path(x_init_NO, unused):  # TODO THIS DOES NOTHING AS THE SAME SAMPLES ARE USED BUT WITH MORE POINTS
@@ -229,42 +339,6 @@ def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upp
     _, exe_path = jax.lax.scan(_create_exe_path, init_x, None, 40)
     exe_path = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), exe_path)
     # TODO again dodgy above, should try to fix so that num_samples from posterior is actuallly used
-
-    x_star_list = optimise_sample(samples, optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x,
-                                  exe_path.y, num_initial_sample_points=1000)
-    return x_star_list, exe_path.x
-
-def sample_and_optimize_posterior_unsure(optimized_posteriors, D, key, lower_bound, upper_bound, num_samples=20):
-    """Sample from posteriors and optimize."""
-    samples = []
-    for gp_idx, posterior in enumerate(optimized_posteriors):
-        key, _key = jr.split(key)
-        data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
-        sample_SB = posterior.sample_approx(num_samples=num_samples, train_data=data, key=_key, num_features=500)
-        samples.append(sample_SB)
-
-    def _multisample_exe_path(init_x, curr_samples):
-        def _create_exe_path(x_init, unused):  # TODO should we use samples or something else for this even?
-            y_1_SB = curr_samples[0](x_init)
-            y_2_SB = curr_samples[1](x_init)
-
-            y_tot = jnp.concatenate((y_1_SB, y_2_SB),
-                                    axis=-1)  # TODO this is dodge as it goes from SB to B1 but if S is > 1 then it not good
-
-            next_x = x_init + y_tot  # TODO still only does one step predictions can we draw multi-step samples quickly using pathwise stuff? I guess not as GP is homoskedastic?
-            next_x = jnp.clip(next_x, jnp.array((domain[0][0], domain[1][0])), jnp.array((domain[0][1], domain[1][1])))
-            path = ExPath(jnp.squeeze(x_init, axis=0), jnp.squeeze(y_tot, axis=0))
-
-            return next_x, path
-
-        _, exe_path = jax.lax.scan(_create_exe_path, init_x, None, 40)
-
-        return exe_path
-
-    # init_x = jnp.tile(jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0), (num_samples, 1))
-    init_x = jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0)
-    multisample_exe_path = jax.vmap(_multisample_exe_path, in_axes=(None, 0))(init_x, samples[0])
-
 
     x_star_list = optimise_sample(samples, optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x,
                                   exe_path.y, num_initial_sample_points=1000)
@@ -360,21 +434,28 @@ init_y = jnp.array(((0.5, 0.5),))  # jnp.array([step_northwest(xi) for xi in ini
 
 D = gpjax.Dataset(X=init_x, y=init_y)
 output_dims = 2  # TODO can change this for later
-gp_models = create_gp_models(output_dims)
+prior = create_gp_model(output_dims)
+
+data = adjust_dataset(init_x, init_y)
 
 for i in range(bo_iters):
     print("---" * 5 + f" Start iteration i={i} " + "---" * 5)
     # Generate optimised posterior
-    optimized_posteriors = []
-    for gp_idx in range(output_dims):
-        key, _key = jrandom.split(key)
-        D_dim = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
-        opt_posterior = return_optimised_posterior(D_dim, gp_models[gp_idx], _key)
-        optimized_posteriors.append(opt_posterior)
+    key, _key = jrandom.split(key)
+    likelihood = gpjax.likelihoods.Gaussian(num_datapoints=data.n, obs_stddev=Static(jnp.array(1e-6)))
+    posterior = prior * likelihood
+    opt_posterior, _ = gpjax.fit(model=posterior,  # TODO do we even need to fit this? idk?
+                                 objective=lambda p, d: -gpjax.objectives.conjugate_mll(p, d),
+                                 train_data=data,
+                                 optim=optax.adam(learning_rate=0.01),
+                                 num_iters=1000,
+                                 safe=True,
+                                 key=_key,
+                                 verbose=False)
 
     # Sample from posteriors and find minimizer
-    key, _key = jr.split(key)
-    x_star, exe_path_list = sample_and_optimize_posterior(optimized_posteriors, D, _key, lower_bound, upper_bound)
+    key, _key = jrandom.split(key)
+    x_star, exe_path_list = sample_and_optimize_posterior(opt_posterior, data, _key, lower_bound, upper_bound)
     y_star = f([x_star[0], x_star[1]])
     print(f"BO Iteration: {i + 1}, Queried Point: {x_star}, Black-Box Function Value:" f" {y_star}")
 
