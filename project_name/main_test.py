@@ -209,6 +209,10 @@ class HelmholtzKernel(gpjax.kernels.stationary.StationaryKernel):
 
         return potential_dvtve + sign * stream_dvtve
 
+    @property
+    def spectral_density(self) -> tfp.distributions.Normal:  # TODO a dodge workaround for now
+        return tfp.distributions.Normal(0.0, 1.0)
+
 
 class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed this from abstract kernel
     def __init__(
@@ -247,8 +251,8 @@ class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed 
 def create_gp_model(output_dims):  # TODO can we vmap this ever?
     """Create multi-output GP models."""
     mean = gpjax.mean_functions.Zero()
-    kernel = VelocityKernel() # TODO make this more general
-    # kernel = HelmholtzKernel() # TODO make this more general
+    # kernel = VelocityKernel() # TODO make this more general
+    kernel = HelmholtzKernel() # TODO make this more general
     # kernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0)
     prior = gpjax.gps.Prior(mean_function=mean, kernel=kernel)
     return prior
