@@ -209,7 +209,7 @@ def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upp
 
     key, _key = jr.split(key)
     initial_sample_points = jr.uniform(_key, shape=(num_initial_sample_points, lower_bound.shape[0]), dtype=jnp.float64,
-                                       minval=lower_bound, maxval=upper_bound)
+                                       minval=lower_bound, maxval=upper_bound)  # TODO can we batch this?
 
     def outer_loop(key):
         sample_func_list = []
@@ -260,31 +260,10 @@ def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upp
 
     return exe_path, initial_sample_points, sample_mus, sample_stds
 
-# def optimise_sample(optimized_posteriors, D, key, lower_bound, upper_bound, exe_path_x, exe_path_y, num_initial_sample_points):
 def optimise_sample(optimized_posteriors, D, initial_sample_points, sample_mus, sample_stds):
-    # key, _key = jr.split(key)
-    # initial_sample_points = jr.uniform(_key, shape=(num_initial_sample_points, lower_bound.shape[0]), dtype=jnp.float64,
-    #                                    minval=lower_bound, maxval=upper_bound)
-
     # the acquisting function thing is here
-    predictive_mus = []
+    predictive_mus = []  # TODO can we batch this
     predictive_stds = []
-    # sample_mus = []
-    # sample_stds = []
-    #
-    # # TODO can we vmap this?
-    # def test_vmap(collected_data_x, collected_data_y, exe_path_x, exe_path_y, posterior, initial_sample_points):
-    #     comb_x = jnp.concatenate((collected_data_x, exe_path_x))
-    #     comb_y = jnp.concatenate((collected_data_y, exe_path_y))
-    #
-    #     data = gpjax.Dataset(X=comb_x, y=comb_y)
-    #     latent_dist = posterior.predict(initial_sample_points, train_data=data)
-    #     predictive_dist = posterior.likelihood(latent_dist)
-    #
-    #     sample_mean = predictive_dist.mean()  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-    #     sample_std = predictive_dist.stddev()
-    #
-    #     return sample_mean, sample_std
 
     for gp_idx, posterior in enumerate(optimized_posteriors):
         data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
