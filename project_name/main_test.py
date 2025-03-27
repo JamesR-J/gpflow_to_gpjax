@@ -47,6 +47,11 @@ import numpy as np
 from gpjax.kernels.computations import DenseKernelComputation
 import pandas as pd
 import time
+from gpjax.kernels.stationary.utils import (
+    build_student_t_distribution,
+    euclidean_distance,
+)
+import tensorflow_probability.substrates.jax.distributions as tfd
 
 config.update("jax_enable_x64", True)
 
@@ -225,7 +230,7 @@ class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed 
     ):
         self.kernel0 = kernel0
         self.kernel1 = kernel1
-        super().__init__(compute_engine=DenseKernelComputation())
+        super().__init__(n_dims=3, compute_engine=DenseKernelComputation())
 
     def __call__(
         self, X: Float[Array, "1 D"], Xp: Float[Array, "1 D"]) -> Float[Array, "1"]:
@@ -241,12 +246,12 @@ class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed 
         return k0_switch * self.kernel0(X, Xp) + k1_switch * self.kernel1(X, Xp)
 
     # @property
-    # def spectral_density(self) -> Float[Array, "N"]:  # TODO this is kinda dodge and idk if it works really
+    # def spectral_density(self) -> tfp.distributions.Normal:  # TODO this is kinda dodge and idk if it works really
     #     spectral0 = self.kernel0.spectral_density
     #     spectral1 = self.kernel1.spectral_density
     #
     #     # Equal weighting of the two kernels
-    #     return spectral0  # 0.5 * spectral0 + 0.5 * spectral1
+    #     return spectral0, spectral1
 
     @property
     def spectral_density(self) -> tfp.distributions.Normal:
@@ -261,48 +266,6 @@ def create_gp_model(output_dims):  # TODO can we vmap this ever?
     # kernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0)
     prior = gpjax.gps.Prior(mean_function=mean, kernel=kernel)
     return prior
-
-def adjust_dataset_old(data):
-    # function to place data from csv into correct array shape
-    def prepare_data(df):
-        pos = jnp.array([df["lon"], df["lat"]])
-        vel = jnp.array([df["ubar"], df["vbar"]])
-        # extract shape stored as 'metadata' in the test data
-        try:
-            shape = (int(df["shape"][1]), int(df["shape"][0]))  # shape = (34,16)
-            return pos, vel, shape
-        except KeyError:
-            return pos, vel
-
-    # loading in data
-
-    gulf_data_train = pd.read_csv(
-        "https://raw.githubusercontent.com/JaxGaussianProcesses/static/main/data/gulfdata_train.csv"
-    )
-    gulf_data_test = pd.read_csv(
-        "https://raw.githubusercontent.com/JaxGaussianProcesses/static/main/data/gulfdata_test.csv"
-    )
-
-    pos_test, vel_test, shape = prepare_data(gulf_data_test)
-    pos_train, vel_train = prepare_data(gulf_data_train)
-
-    # Change vectors x -> X = (x,z), and vectors y -> Y = (y,z) via the artificial z label
-    def label_position(data):  # 2,20
-        # introduce alternating z label
-        n_points = len(data[0])
-        label = jnp.tile(jnp.array([0.0, 1.0]), n_points)
-        return jnp.vstack((jnp.repeat(data, repeats=2, axis=1), label)).T
-
-    # change vectors y -> Y by reshaping the velocity measurements
-    def stack_velocity(data):  # 2,20
-        return data.T.flatten().reshape(-1, 1)
-
-    def dataset_3d(pos, vel):
-        return gpjax.Dataset(label_position(pos), stack_velocity(vel))
-
-    # turns 2,20 into 40,3 and 40,1
-
-    return dataset_3d(pos_train, vel_train), dataset_3d(pos_test, vel_test)
 
 def adjust_dataset(x, y):
     # Change vectors x -> X = (x,z), and vectors y -> Y = (y,z) via the artificial z label
@@ -341,9 +304,9 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
             this_x, key = runner_state
             key, _key = jrandom.split(key)
             adj_x = adjust_dataset(this_x, jnp.ones((this_x.shape[0], 2)))
-            # y_tot_NO = jnp.swapaxes(sample_func(adj_x.X), 0, 1)
-            latent_dist = optimized_posterior.predict(adj_x.X, train_data=D)
-            y_tot_NO = latent_dist.mean().reshape(-1, 2)
+            y_tot_NO = jnp.swapaxes(sample_func(adj_x.X), 0, 1)
+            # latent_dist = optimized_posterior.predict(adj_x.X, train_data=D)
+            # y_tot_NO = latent_dist.mean().reshape(-1, 2)
             # y_tot_NO = latent_dist.sample(_key, (1,))
 
             next_x = jnp.clip(this_x + y_tot_NO, jnp.array([domain[0][0], domain[1][0]]),
@@ -351,7 +314,8 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
 
             return (next_x, key), (this_x, y_tot_NO)
 
-        _, (all_xs, all_ys) = jax.lax.scan(_step_fn, (init_x, key), None, length=40)
+        key, _key = jrandom.split(key)
+        _, (all_xs, all_ys) = jax.lax.scan(_step_fn, (init_x, _key), None, length=40)
 
         exe_path = create_path(all_xs, all_ys)
         exe_path_new = adjust_dataset(exe_path.x, exe_path.y)
@@ -383,8 +347,8 @@ def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_
     latent_dist = opt_posterior.predict(adj_sample_points.X, train_data=D)
     predictive_dist = opt_posterior.likelihood(latent_dist)
 
-    predictive_mean = predictive_dist.mean().reshape(-1, 2)  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-    predictive_std = predictive_dist.stddev().reshape(-1, 2)
+    predictive_mean = predictive_dist.mean() # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
+    predictive_std = predictive_dist.stddev()
 
     # # TODO can we vmap this?
     # def test_vmap(collected_data, exe_path, posterior, initial_sample_points):
@@ -419,6 +383,7 @@ def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_
         return acq_exe
 
     acq_list = acq_exe_normal(predictive_std, sample_stds)
+    # TODO unsure if should adjust the predictions to be the correct size or the single output gp size?
 
     # best_x = jnp.array([initial_sample_points[jnp.argmin(initial_sample_y)]])
     # best_x = jnp.array([initial_sample_points[jnp.argmin(acq_list)]])
@@ -478,8 +443,12 @@ for i in range(bo_iters):
     ind_time = time.time()
     x_star = optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_stds)
     print(f"{time.time() - ind_time} - Optimisation time taken")
-    y_star = f([x_star[0], x_star[1]])
+    y_star = f([x_star[0, 0], x_star[0, 1]])
     print(f"BO Iteration: {i + 1}, Queried Point: {x_star}, Black-Box Function Value:" f" {y_star}")
+
+    adj_stars = adjust_dataset(x_star, jnp.array(y_star))
+
+    data = data + gpjax.Dataset(X=adj_stars.X, y=adj_stars.y)
 
     # Plot
     fig, ax = plt.subplots(1, 1, figsize=(5, 5))
