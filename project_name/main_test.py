@@ -242,10 +242,10 @@ def sample_and_optimize_posterior(optimized_posteriors, D, key, lower_bound, upp
 
             data = gpjax.Dataset(X=comb_x, y=comb_y)
             latent_dist = posterior.predict(initial_sample_points, train_data=data)
-            predictive_dist = posterior.likelihood(latent_dist)
+            # predictive_dist = posterior.likelihood(latent_dist)
 
-            sample_mus.append(predictive_dist.mean())  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-            sample_stds.append(predictive_dist.stddev())
+            sample_mus.append(latent_dist.mean())  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
+            sample_stds.append(latent_dist.stddev())
 
         return all_xs, all_ys, exe_path, jnp.array(sample_mus), jnp.array(sample_stds)
 
