@@ -52,6 +52,7 @@ from gpjax.kernels.stationary.utils import (
     euclidean_distance,
 )
 import tensorflow_probability.substrates.jax.distributions as tfd
+from custom_sample_approx import adj_sample_approx
 
 config.update("jax_enable_x64", True)
 
@@ -299,6 +300,7 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
         dataset = gpjax.Dataset(dataset_x, dataset_y)
         main_key, _key = jrandom.split(key)
         sample_func = posterior.sample_approx(num_samples=1, train_data=dataset, key=_key, num_features=500)
+        sample_func = adj_sample_approx(posterior, num_samples=1, train_data=dataset, key=_key, num_features=500)
 
         def _step_fn(runner_state, _):
             this_x, key = runner_state
@@ -307,7 +309,7 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
             y_tot_NO = jnp.swapaxes(sample_func(adj_x.X), 0, 1)
             # latent_dist = optimized_posterior.predict(adj_x.X, train_data=dataset)
             # y_tot_NO = latent_dist.mean().reshape(-1, 2)
-            y_tot_NO = latent_dist.sample(_key, (1,))
+            # y_tot_NO = latent_dist.sample(_key, (1,))
 
             next_x = jnp.clip(this_x + y_tot_NO, jnp.array([domain[0][0], domain[1][0]]),
                               jnp.array([domain[0][1], domain[1][1]]))
