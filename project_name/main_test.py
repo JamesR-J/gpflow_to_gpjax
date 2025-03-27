@@ -304,10 +304,10 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
             this_x, key = runner_state
             key, _key = jrandom.split(key)
             adj_x = adjust_dataset(this_x, jnp.ones((this_x.shape[0], 2)))
-            # y_tot_NO = jnp.swapaxes(sample_func(adj_x.X), 0, 1)
-            latent_dist = optimized_posterior.predict(adj_x.X, train_data=dataset)
+            y_tot_NO = jnp.swapaxes(sample_func(adj_x.X), 0, 1)
+            # latent_dist = optimized_posterior.predict(adj_x.X, train_data=dataset)
             # y_tot_NO = latent_dist.mean().reshape(-1, 2)
-            y_tot_NO = latent_dist.sample(main_key, (1,))
+            y_tot_NO = latent_dist.sample(_key, (1,))
 
             next_x = jnp.clip(this_x + y_tot_NO, jnp.array([domain[0][0], domain[1][0]]),
                               jnp.array([domain[0][1], domain[1][1]]))
@@ -328,7 +328,7 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
         latent_dist = posterior.predict(adj_sample_points.X, train_data=comb_D)
         # predictive_dist = posterior.likelihood(latent_dist)
         sample_mus = latent_dist.mean()
-        sample_stds = latent_dist.stddev().reshape(2, -1)
+        sample_stds = latent_dist.stddev().reshape(-1, 2)
 
         return all_xs, all_ys, exe_path, sample_mus, sample_stds
 
@@ -344,10 +344,10 @@ def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_
     # Grab the posterior mus and covariance for each GP
     adj_sample_points = adjust_dataset(initial_sample_points, jnp.ones((initial_sample_points.shape[0], 2)))
     latent_dist = opt_posterior.predict(adj_sample_points.X, train_data=D)
-    predictive_dist = opt_posterior.likelihood(latent_dist)
+    # predictive_dist = opt_posterior.likelihood(latent_dist)
 
-    predictive_mean = predictive_dist.mean() # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-    predictive_std = predictive_dist.stddev().reshape(2, -1)
+    predictive_mean = latent_dist.mean() # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
+    predictive_std = latent_dist.stddev().reshape(-1, 2)
 
     # # TODO can we vmap this?
     # def test_vmap(collected_data, exe_path, posterior, initial_sample_points):
@@ -380,8 +380,9 @@ def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_
 
         return acq_exe
 
-    acq_list = acq_exe_normal(predictive_std, sample_stds)
+    acq_list = acq_exe_normal(jnp.swapaxes(predictive_std, 0, 1), jnp.swapaxes(sample_stds, 1, 2))
     # TODO the shapes above are flipped maybe can sort this out at some point
+    # TODO is swapaxes for 2D the same as the transpose?
 
     # best_x = jnp.array([initial_sample_points[jnp.argmin(initial_sample_y)]])
     # best_x = jnp.array([initial_sample_points[jnp.argmin(acq_list)]])
@@ -405,8 +406,11 @@ bo_iters = 25
 num_samples = 20
 num_initial_sample_points = 1000
 
-init_x = jnp.array(((4.146202844165692, 0.44793055421536542),))  # jnp.array(unif_random_sample_domain(domain, n_init_data))
-init_y = jnp.array(((0.5, 0.5),))  # jnp.array([step_northwest(xi) for xi in init_x])  # TODO hard coded to test
+# init_x = jnp.array(((4.146202844165692, 0.44793055421536542),))  # jnp.array(unif_random_sample_domain(domain, n_init_data))
+# init_y = jnp.array(((0.5, 0.5),))  # jnp.array([step_northwest(xi) for xi in init_x])  # TODO hard coded to test
+
+init_x = jnp.array(unif_random_sample_domain(domain, n_init_data))
+init_y = jnp.array([step_northwest(xi) for xi in init_x])
 
 D = gpjax.Dataset(X=init_x, y=init_y)
 data = adjust_dataset(init_x, init_y)
