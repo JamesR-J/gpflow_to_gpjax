@@ -230,8 +230,8 @@ class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed 
         self, X: Float[Array, "1 D"], Xp: Float[Array, "1 D"]) -> Float[Array, "1"]:
         # standard RBF-SE kernel is x and x' are on the same output, otherwise returns 0
 
-        z = jnp.array(X[2], dtype=int)
-        zp = jnp.array(Xp[2], dtype=int)
+        z = jnp.array(X[-1], dtype=int)
+        zp = jnp.array(Xp[-1], dtype=int)
 
         # achieve the correct value via 'switches' that are either 1 or 0
         k0_switch = ((z + 1) % 2) * ((zp + 1) % 2)
@@ -239,20 +239,20 @@ class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed 
 
         return k0_switch * self.kernel0(X, Xp) + k1_switch * self.kernel1(X, Xp)
 
-    @property
-    def spectral_density(self) -> Float[Array, "N"]:  # TODO this is kinda dodge and idk if it works really
-        spectral0 = self.kernel0.spectral_density
-        spectral1 = self.kernel1.spectral_density
-
-        # Equal weighting of the two kernels
-        return spectral0  # 0.5 * spectral0 + 0.5 * spectral1
+    # @property
+    # def spectral_density(self) -> Float[Array, "N"]:  # TODO this is kinda dodge and idk if it works really
+    #     spectral0 = self.kernel0.spectral_density
+    #     spectral1 = self.kernel1.spectral_density
+    #
+    #     # Equal weighting of the two kernels
+    #     return spectral0  # 0.5 * spectral0 + 0.5 * spectral1
 
 
 def create_gp_model(output_dims):  # TODO can we vmap this ever?
     """Create multi-output GP models."""
     mean = gpjax.mean_functions.Zero()
-    # kernel = VelocityKernel() # TODO make this more general
-    kernel = HelmholtzKernel() # TODO make this more general
+    kernel = VelocityKernel() # TODO make this more general
+    # kernel = HelmholtzKernel() # TODO make this more general
     # kernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0)
     prior = gpjax.gps.Prior(mean_function=mean, kernel=kernel)
     return prior
@@ -323,7 +323,7 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
     key, _key = jr.split(key)
     # TODO can do the above and vmap to get many different samples
     # sample_SB = optimized_posterior.sample_approx(num_samples=1, train_data=D, key=_key, num_features=500)  # TODO apparently pathwise sampling does not work on non-stationary kernels
-    sample_SB = optimized_posterior.sample_approx(num_samples=1, train_data=D, key=_key)
+    sample_SB = optimized_posterior.predict(num_samples=1, train_data=D, key=_key)
 
     # do it for 40 steps
     def _create_exe_path(x_init_NO, unused):  # TODO THIS DOES NOTHING AS THE SAME SAMPLES ARE USED BUT WITH MORE POINTS
