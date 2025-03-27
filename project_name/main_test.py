@@ -328,7 +328,7 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
         latent_dist = posterior.predict(adj_sample_points.X, train_data=comb_D)
         predictive_dist = posterior.likelihood(latent_dist)
         sample_mus = predictive_dist.mean()
-        sample_stds = predictive_dist.stddev()
+        sample_stds = predictive_dist.stddev().reshape(2, -1)
 
         return all_xs, all_ys, exe_path, sample_mus, sample_stds
 
@@ -348,7 +348,7 @@ def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_
     predictive_dist = opt_posterior.likelihood(latent_dist)
 
     predictive_mean = predictive_dist.mean() # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-    predictive_std = predictive_dist.stddev()
+    predictive_std = predictive_dist.stddev().reshape(2, -1)
 
     # # TODO can we vmap this?
     # def test_vmap(collected_data, exe_path, posterior, initial_sample_points):
@@ -375,7 +375,6 @@ def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_
         def entropy_given_normal_std_list(std_list):
             return jnp.log(std_list) + jnp.log(jnp.sqrt(2 * jnp.pi)) + 0.5  # TODO check if correct std or var
         h_post = jnp.sum(entropy_given_normal_std_list(jnp.array(predictive)), axis=0)
-
         h_sample = jnp.mean(jnp.sum(entropy_given_normal_std_list(jnp.array(sample)), axis=0), axis=0)
 
         acq_exe = h_post - h_sample  # TODO add in the sample average
@@ -383,7 +382,7 @@ def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_
         return acq_exe
 
     acq_list = acq_exe_normal(predictive_std, sample_stds)
-    # TODO unsure if should adjust the predictions to be the correct size or the single output gp size?
+    # TODO the shapes above are flipped maybe can sort this out at some point
 
     # best_x = jnp.array([initial_sample_points[jnp.argmin(initial_sample_y)]])
     # best_x = jnp.array([initial_sample_points[jnp.argmin(acq_list)]])
@@ -446,7 +445,7 @@ for i in range(bo_iters):
     y_star = f([x_star[0, 0], x_star[0, 1]])
     print(f"BO Iteration: {i + 1}, Queried Point: {x_star}, Black-Box Function Value:" f" {y_star}")
 
-    adj_stars = adjust_dataset(x_star, jnp.array(y_star))
+    adj_stars = adjust_dataset(x_star, jnp.expand_dims(jnp.array(y_star), axis=0))
 
     data = data + gpjax.Dataset(X=adj_stars.X, y=adj_stars.y)
 
