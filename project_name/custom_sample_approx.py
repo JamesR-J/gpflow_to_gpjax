@@ -278,7 +278,6 @@ class MO_RFF(AbstractKernel):
 
         part_1 = jnp.expand_dims(k0_switch, axis=-1) * self.compute_features_otherfile(self.frequencies0, self.kernel0, x[:, :2]) * jnp.sqrt(self.kernel0.variance.value / self.num_basis_fns)
         part_2 = jnp.expand_dims(k1_switch, axis=-1) * self.compute_features_otherfile(self.frequencies1, self.kernel1, x[:, :2]) * jnp.sqrt(self.kernel1.variance.value / self.num_basis_fns)
-
         return part_1 + part_2
         # TODO unsure the above is the most correct
         # return self.compute_engine.compute_features(self, x)
