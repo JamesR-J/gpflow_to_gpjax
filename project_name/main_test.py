@@ -334,10 +334,14 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
         return ExPath(jnp.squeeze(xs, axis=-2), jnp.squeeze(ys, axis=-2))
 
     def outer_loop(init_x, key):
+        key, _key = jrandom.split(key)
+        sample_func = posterior.sample_approx(num_samples=1, train_data=D, key=_key, num_features=500)
+
         def _step_fn(runner_state, _):
             this_x, key = runner_state
             key, _key = jrandom.split(key)
             adj_x = adjust_dataset(this_x, jnp.ones((this_x.shape[0], 2)))
+            # y_tot_NO = jnp.swapaxes(sample_func(adj_x.X), 0, 1)
             latent_dist = optimized_posterior.predict(adj_x.X, train_data=D)
             y_tot_NO = latent_dist.mean().reshape(-1, 2)
             # y_tot_NO = latent_dist.sample(_key, (1,))
