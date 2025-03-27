@@ -46,6 +46,7 @@ from typing import NamedTuple
 import numpy as np
 from gpjax.kernels.computations import DenseKernelComputation
 import pandas as pd
+import time
 
 config.update("jax_enable_x64", True)
 
@@ -247,6 +248,10 @@ class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed 
     #     # Equal weighting of the two kernels
     #     return spectral0  # 0.5 * spectral0 + 0.5 * spectral1
 
+    @property
+    def spectral_density(self) -> tfp.distributions.Normal:
+        return tfp.distributions.Normal(0.0, 1.0)
+
 
 def create_gp_model(output_dims):  # TODO can we vmap this ever?
     """Create multi-output GP models."""
@@ -318,87 +323,85 @@ def adjust_dataset(x, y):
 
     return dataset_3d(jnp.swapaxes(x, 0, 1), jnp.swapaxes(y, 0, 1))
 
-def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, upper_bound, num_samples=1):
+def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, upper_bound, num_samples=1, num_initial_sample_points=1):
     """Sample from posteriors and optimize."""
     key, _key = jr.split(key)
-    # TODO can do the above and vmap to get many different samples
-    # sample_SB = optimized_posterior.sample_approx(num_samples=1, train_data=D, key=_key, num_features=500)  # TODO apparently pathwise sampling does not work on non-stationary kernels
-    sample_SB = optimized_posterior.predict(num_samples=1, train_data=D, key=_key)
-
-    # do it for 40 steps
-    def _create_exe_path(x_init_NO, unused):  # TODO THIS DOES NOTHING AS THE SAME SAMPLES ARE USED BUT WITH MORE POINTS
-        y_1_NB = samples[0](x_init_NO)
-        y_2_NB = samples[1](x_init_NO)
-
-        y_tot_NO = jnp.concatenate((y_1_NB, y_2_NB), axis=-1)
-
-        next_x_NO = x_init_NO + y_tot_NO  # TODO still only does one step predictions can we draw multi-step samples quickly using pathwise stuff? I guess not as GP is homoskedastic?
-        next_x = jnp.clip(next_x_NO, jnp.array((domain[0][0], domain[1][0])), jnp.array((domain[0][1], domain[1][1])))
-        path = ExPath(x_init_NO, y_tot_NO)
-
-        return next_x, path
-
-    init_x = jnp.tile(jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0), (num_samples, 1))
-    # init_x = jnp.expand_dims(jnp.array((0.5, 0.5)), axis=0)
-    _, exe_path = jax.lax.scan(_create_exe_path, init_x, None, 40)
-    exe_path = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), exe_path)
-    # TODO again dodgy above, should try to fix so that num_samples from posterior is actuallly used
-
-    x_star_list = optimise_sample(samples, optimized_posteriors, D, key, lower_bound, upper_bound, exe_path.x,
-                                  exe_path.y, num_initial_sample_points=1000)
-    return x_star_list, exe_path.x
-
-def optimise_sample(sample, optimized_posteriors, D, key, lower_bound, upper_bound, exe_path_x, exe_path_y, num_initial_sample_points):
-    key, _key = jr.split(key)
     initial_sample_points = jr.uniform(_key, shape=(num_initial_sample_points, lower_bound.shape[0]), dtype=jnp.float64,
-                                       minval=lower_bound, maxval=upper_bound)
-    # initial_sample_y = sample(initial_sample_points)
+                                       minval=lower_bound, maxval=upper_bound)  # TODO can we batch this?
+    D = adjust_dataset(D.X, D.y)
 
-    # TODO add the acquisition function thing here basically
+    def create_path(xs, ys):
+        return ExPath(jnp.squeeze(xs, axis=-2), jnp.squeeze(ys, axis=-2))
+
+    def outer_loop(init_x, key):
+        def _step_fn(runner_state, _):
+            this_x, key = runner_state
+            key, _key = jrandom.split(key)
+            adj_x = adjust_dataset(this_x, jnp.ones((this_x.shape[0], 2)))
+            latent_dist = optimized_posterior.predict(adj_x.X, train_data=D)
+            y_tot_NO = latent_dist.mean().reshape(-1, 2)
+            # y_tot_NO = latent_dist.sample(_key, (1,))
+
+            next_x = jnp.clip(this_x + y_tot_NO, jnp.array([domain[0][0], domain[1][0]]),
+                              jnp.array([domain[0][1], domain[1][1]]))
+
+            return (next_x, key), (this_x, y_tot_NO)
+
+        _, (all_xs, all_ys) = jax.lax.scan(_step_fn, (init_x, key), None, length=40)
+
+        exe_path = create_path(all_xs, all_ys)
+        exe_path_new = adjust_dataset(exe_path.x, exe_path.y)
+
+        comb_D = D + gpjax.Dataset(exe_path_new.X, exe_path_new.y)
+        # TODO is this the error, when appending data what form should it be in?
+
+        adj_sample_points = adjust_dataset(initial_sample_points, jnp.ones((initial_sample_points.shape[0], 2)))
+
+        latent_dist = posterior.predict(adj_sample_points.X, train_data=comb_D)
+        predictive_dist = posterior.likelihood(latent_dist)
+        sample_mus = predictive_dist.mean()
+        sample_stds = predictive_dist.stddev()
+
+        return all_xs, all_ys, exe_path, sample_mus, sample_stds
+
+    # Create initial state for all samples
+    init_x = jnp.array([[0.5, 0.5]])
+    key, _key = jrandom.split(key)
+    batch_key = jrandom.split(key, num_samples)
+    all_xs, all_ys, exe_path, sample_mus, sample_stds = jax.vmap(outer_loop, in_axes=(None, 0))(init_x, batch_key)
+
+    return exe_path, initial_sample_points, sample_mus, sample_stds
+
+def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_stds):
     # Grab the posterior mus and covariance for each GP
-    predictive_mus = []
-    predictive_stds = []
-    for gp_idx, posterior in enumerate(optimized_posteriors):
-        data = gpjax.Dataset(X=D.X, y=jnp.expand_dims(D.y[:, gp_idx], axis=-1))
-        latent_dist = posterior.predict(initial_sample_points, train_data=data)
-        predictive_dist = posterior.likelihood(latent_dist)
+    D = adjust_dataset(D.X, D.y)
+    adj_sample_points = adjust_dataset(initial_sample_points, jnp.ones((initial_sample_points.shape[0], 2)))
+    latent_dist = opt_posterior.predict(adj_sample_points.X, train_data=D)
+    predictive_dist = opt_posterior.likelihood(latent_dist)
 
-        predictive_mean = predictive_dist.mean()  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-        predictive_std = predictive_dist.stddev()
-        predictive_mus.append(predictive_mean)
-        predictive_stds.append(predictive_std)
+    predictive_mean = predictive_dist.mean().reshape(-1, 2)  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
+    predictive_std = predictive_dist.stddev().reshape(-1, 2)
 
-    # TODO can we vmap this?
-    def test_vmap(collected_data_x, collected_data_y, exe_path_x, exe_path_y, posterior, initial_sample_points):
-        comb_x = jnp.concatenate((collected_data_x, exe_path_x))
-        comb_y = jnp.concatenate((collected_data_y, exe_path_y))
+    # # TODO can we vmap this?
+    # def test_vmap(collected_data, exe_path, posterior, initial_sample_points):
+    #     data = gpjax.Dataset(X=comb_x, y=comb_y)
+    #     latent_dist = posterior.predict(initial_sample_points, train_data=data)
+    #     predictive_dist = posterior.likelihood(latent_dist)
+    #
+    #     sample_mean = predictive_dist.mean()  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
+    #     sample_std = predictive_dist.stddev()
+    #
+    #     return sample_mean, sample_std
+    #
+    # sample_mean, sample_std = jax.vmap(test_vmap, in_axes=(None, None, 0, 0, None, None))(D.X, jnp.expand_dims(D.y[:, gp_idx], axis=-1), exe_path_x, np.expand_dims(exe_path_y[:, :, gp_idx], axis=-1), posterior, initial_sample_points)
+    # #
+    # # data = gpjax.Dataset(X=comb_x, y=jnp.expand_dims(comb_y[:, gp_idx], axis=-1))
+    # # latent_dist = posterior.predict(initial_sample_points, train_data=data)
+    # # predictive_dist = posterior.likelihood(latent_dist)
+    #
+    # # sample_mean = predictive_dist.mean()  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
+    # # sample_std = predictive_dist.stddev()
 
-        data = gpjax.Dataset(X=comb_x, y=comb_y)
-        latent_dist = posterior.predict(initial_sample_points, train_data=data)
-        predictive_dist = posterior.likelihood(latent_dist)
-
-        sample_mean = predictive_dist.mean()  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-        sample_std = predictive_dist.stddev()
-
-        return sample_mean, sample_std
-
-    # comb_x = jnp.concatenate((D.X, exe_path_x))  # TODO D should expand as we gain more data per step
-    # comb_y = jnp.concatenate((D.y, exe_path_y))
-
-    sample_mus = []
-    sample_stds = []
-    for gp_idx, posterior in enumerate(optimized_posteriors):
-        sample_mean, sample_std = jax.vmap(test_vmap, in_axes=(None, None, 0, 0, None, None))(D.X, jnp.expand_dims(D.y[:, gp_idx], axis=-1), exe_path_x, np.expand_dims(exe_path_y[:, :, gp_idx], axis=-1), posterior, initial_sample_points)
-        #
-        # data = gpjax.Dataset(X=comb_x, y=jnp.expand_dims(comb_y[:, gp_idx], axis=-1))
-        # latent_dist = posterior.predict(initial_sample_points, train_data=data)
-        # predictive_dist = posterior.likelihood(latent_dist)
-
-        # sample_mean = predictive_dist.mean()  # TODO should this be predictive or should it be just posterior, if latter then do we need the points?
-        # sample_std = predictive_dist.stddev()
-
-        sample_mus.append(sample_mean)
-        sample_stds.append(sample_std)
 
     def acq_exe_normal(predictive, sample):
         def entropy_given_normal_std_list(std_list):
@@ -411,7 +414,7 @@ def optimise_sample(sample, optimized_posteriors, D, key, lower_bound, upper_bou
 
         return acq_exe
 
-    acq_list = acq_exe_normal(predictive_stds, sample_stds)
+    acq_list = acq_exe_normal(predictive_std, sample_stds)
 
     # best_x = jnp.array([initial_sample_points[jnp.argmin(initial_sample_y)]])
     # best_x = jnp.array([initial_sample_points[jnp.argmin(acq_list)]])
@@ -432,6 +435,8 @@ lower_bound = jnp.array([domain[0][0], domain[1][0]])
 upper_bound = jnp.array([domain[0][1], domain[1][1]])
 n_init_data = 1
 bo_iters = 25
+num_samples = 20
+num_initial_sample_points = 1000
 
 init_x = jnp.array(((4.146202844165692, 0.44793055421536542),))  # jnp.array(unif_random_sample_domain(domain, n_init_data))
 init_y = jnp.array(((0.5, 0.5),))  # jnp.array([step_northwest(xi) for xi in init_x])  # TODO hard coded to test
@@ -442,13 +447,14 @@ prior = create_gp_model(output_dims)
 
 data = adjust_dataset(init_x, init_y)
 
+start_time = time.time()
 for i in range(bo_iters):
     print("---" * 5 + f" Start iteration i={i} " + "---" * 5)
     # Generate optimised posterior
     key, _key = jrandom.split(key)
     likelihood = gpjax.likelihoods.Gaussian(num_datapoints=data.n, obs_stddev=Static(jnp.array(1e-6)))
     posterior = prior * likelihood
-    opt_posterior, _ = gpjax.fit(model=posterior,  # TODO do we even need to fit this? idk?
+    opt_posterior, _ = gpjax.fit(model=posterior,
                                  objective=lambda p, d: -gpjax.objectives.conjugate_mll(p, d),
                                  train_data=data,
                                  optim=optax.adam(learning_rate=0.01),
@@ -459,18 +465,24 @@ for i in range(bo_iters):
 
     # Sample from posteriors and find minimizer
     key, _key = jrandom.split(key)
-    x_star, exe_path_list = sample_and_optimize_posterior(opt_posterior, data, _key, lower_bound, upper_bound)
+    ind_time = time.time()
+    exe_path, initial_sample_points, sample_mus, sample_stds = sample_and_optimize_posterior(opt_posterior, D,
+                                                                                             _key, lower_bound,
+                                                                                             upper_bound, num_samples,
+                                                                                             num_initial_sample_points)
+    print(f"{time.time() - ind_time} - Exe path time taken")
+    ind_time = time.time()
+    x_star = optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_stds)
+    print(f"{time.time() - ind_time} - Optimisation time taken")
     y_star = f([x_star[0], x_star[1]])
     print(f"BO Iteration: {i + 1}, Queried Point: {x_star}, Black-Box Function Value:" f" {y_star}")
-
-    D = D + gpjax.Dataset(X=x_star, y=jnp.expand_dims(jnp.array(y_star), axis=0))
 
     # Plot
     fig, ax = plt.subplots(1, 1, figsize=(5, 5))
 
     # Plot true path and posterior path samples
     plot_path_2d(true_path, ax, true_path=True)
-    for path in exe_path_list:  # TODO until we batch it and it becomes a list
+    for path in exe_path.x:
         plot_path_2d_jax(path, ax)
 
     # Plot observations
@@ -483,7 +495,9 @@ for i in range(bo_iters):
 
     save_figure = True
     if save_figure:
-        neatplot.save_figure(f"bax_multi_new{i}", "png")
+        neatplot.save_figure(f"bax_multi_gpjax_new{i}", "png")
+
+print(time.time() - start_time)
 
 
 
