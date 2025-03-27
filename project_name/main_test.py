@@ -291,23 +291,23 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
     key, _key = jr.split(key)
     initial_sample_points = jr.uniform(_key, shape=(num_initial_sample_points, lower_bound.shape[0]), dtype=jnp.float64,
                                        minval=lower_bound, maxval=upper_bound)  # TODO can we batch this?
-    D = adjust_dataset(D.X, D.y)
 
     def create_path(xs, ys):
         return ExPath(jnp.squeeze(xs, axis=-2), jnp.squeeze(ys, axis=-2))
 
-    def outer_loop(init_x, key):
-        key, _key = jrandom.split(key)
-        sample_func = posterior.sample_approx(num_samples=1, train_data=D, key=_key, num_features=500)
+    def outer_loop(init_x, dataset_x, dataset_y, key):
+        dataset = gpjax.Dataset(dataset_x, dataset_y)
+        main_key, _key = jrandom.split(key)
+        sample_func = posterior.sample_approx(num_samples=1, train_data=dataset, key=_key, num_features=500)
 
         def _step_fn(runner_state, _):
             this_x, key = runner_state
             key, _key = jrandom.split(key)
             adj_x = adjust_dataset(this_x, jnp.ones((this_x.shape[0], 2)))
-            y_tot_NO = jnp.swapaxes(sample_func(adj_x.X), 0, 1)
-            # latent_dist = optimized_posterior.predict(adj_x.X, train_data=D)
+            # y_tot_NO = jnp.swapaxes(sample_func(adj_x.X), 0, 1)
+            latent_dist = optimized_posterior.predict(adj_x.X, train_data=dataset)
             # y_tot_NO = latent_dist.mean().reshape(-1, 2)
-            # y_tot_NO = latent_dist.sample(_key, (1,))
+            y_tot_NO = latent_dist.sample(main_key, (1,))
 
             next_x = jnp.clip(this_x + y_tot_NO, jnp.array([domain[0][0], domain[1][0]]),
                               jnp.array([domain[0][1], domain[1][1]]))
@@ -318,17 +318,17 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
         _, (all_xs, all_ys) = jax.lax.scan(_step_fn, (init_x, _key), None, length=40)
 
         exe_path = create_path(all_xs, all_ys)
-        exe_path_new = adjust_dataset(exe_path.x, exe_path.y)
+        adj_exe_path = adjust_dataset(exe_path.x, exe_path.y)
 
-        comb_D = D + gpjax.Dataset(exe_path_new.X, exe_path_new.y)
+        comb_D = dataset + gpjax.Dataset(adj_exe_path.X, adj_exe_path.y)
         # TODO is this the error, when appending data what form should it be in?
 
         adj_sample_points = adjust_dataset(initial_sample_points, jnp.ones((initial_sample_points.shape[0], 2)))
 
         latent_dist = posterior.predict(adj_sample_points.X, train_data=comb_D)
-        predictive_dist = posterior.likelihood(latent_dist)
-        sample_mus = predictive_dist.mean()
-        sample_stds = predictive_dist.stddev().reshape(2, -1)
+        # predictive_dist = posterior.likelihood(latent_dist)
+        sample_mus = latent_dist.mean()
+        sample_stds = latent_dist.stddev().reshape(2, -1)
 
         return all_xs, all_ys, exe_path, sample_mus, sample_stds
 
@@ -336,13 +336,12 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
     init_x = jnp.array([[0.5, 0.5]])
     key, _key = jrandom.split(key)
     batch_key = jrandom.split(key, num_samples)
-    all_xs, all_ys, exe_path, sample_mus, sample_stds = jax.vmap(outer_loop, in_axes=(None, 0))(init_x, batch_key)
+    all_xs, all_ys, exe_path, sample_mus, sample_stds = jax.vmap(outer_loop, in_axes=(None, None, None, 0))(init_x, D.X, D.y, batch_key)
 
     return exe_path, initial_sample_points, sample_mus, sample_stds
 
 def optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_stds):
     # Grab the posterior mus and covariance for each GP
-    D = adjust_dataset(D.X, D.y)
     adj_sample_points = adjust_dataset(initial_sample_points, jnp.ones((initial_sample_points.shape[0], 2)))
     latent_dist = opt_posterior.predict(adj_sample_points.X, train_data=D)
     predictive_dist = opt_posterior.likelihood(latent_dist)
@@ -410,10 +409,9 @@ init_x = jnp.array(((4.146202844165692, 0.44793055421536542),))  # jnp.array(uni
 init_y = jnp.array(((0.5, 0.5),))  # jnp.array([step_northwest(xi) for xi in init_x])  # TODO hard coded to test
 
 D = gpjax.Dataset(X=init_x, y=init_y)
+data = adjust_dataset(init_x, init_y)
 output_dims = 2  # TODO can change this for later
 prior = create_gp_model(output_dims)
-
-data = adjust_dataset(init_x, init_y)
 
 start_time = time.time()
 for i in range(bo_iters):
@@ -434,19 +432,18 @@ for i in range(bo_iters):
     # Sample from posteriors and find minimizer
     key, _key = jrandom.split(key)
     ind_time = time.time()
-    exe_path, initial_sample_points, sample_mus, sample_stds = sample_and_optimize_posterior(opt_posterior, D,
+    exe_path, initial_sample_points, sample_mus, sample_stds = sample_and_optimize_posterior(opt_posterior, data,
                                                                                              _key, lower_bound,
                                                                                              upper_bound, num_samples,
                                                                                              num_initial_sample_points)
     print(f"{time.time() - ind_time} - Exe path time taken")
     ind_time = time.time()
-    x_star = optimise_sample(opt_posterior, D, initial_sample_points, sample_mus, sample_stds)
+    x_star = optimise_sample(opt_posterior, data, initial_sample_points, sample_mus, sample_stds)
     print(f"{time.time() - ind_time} - Optimisation time taken")
     y_star = f([x_star[0, 0], x_star[0, 1]])
     print(f"BO Iteration: {i + 1}, Queried Point: {x_star}, Black-Box Function Value:" f" {y_star}")
 
     adj_stars = adjust_dataset(x_star, jnp.expand_dims(jnp.array(y_star), axis=0))
-
     data = data + gpjax.Dataset(X=adj_stars.X, y=adj_stars.y)
 
     # Plot
@@ -458,8 +455,8 @@ for i in range(bo_iters):
         plot_path_2d_jax(path, ax)
 
     # Plot observations
-    x_obs = [xi[0] for xi in D.X]
-    y_obs = [xi[1] for xi in D.X]
+    x_obs = [xi[0] for xi in data.X[:, :2]]
+    y_obs = [xi[1] for xi in data.X[:, :2]]
     ax.scatter(x_obs, y_obs, color="green", s=120)
 
     ax.scatter(x_star[1][0], x_star[1][1], color="deeppink", s=120, zorder=100)
