@@ -113,6 +113,7 @@ def adj_sample_approx(posterior,
     fourier_feature_fn = _build_fourier_features_fn(posterior.prior, num_features, key)
 
     # sample fourier weights
+    # fourier_weights = _build_fourier_weights(train_data.y.shape[0], num_samples, num_features, key)
     fourier_weights = jr.normal(key, [num_samples, 2 * num_features])  # [B, L]
 
     # sample weights v for canonical features
@@ -120,32 +121,20 @@ def adj_sample_approx(posterior,
     obs_var = posterior.likelihood.obs_stddev.value ** 2
     Kxx = posterior.prior.kernel.gram(train_data.X)  # [N, N]
     Sigma = Kxx + I_like(Kxx) * (obs_var + posterior.jitter)  # [N, N]
-    eps = jnp.sqrt(obs_var) * jr.normal(key, [train_data.n, num_samples])  # [N, B]
+    eps = jnp.sqrt(obs_var) * jr.normal(key, [train_data.n, num_samples]) # [N, B]
     y = train_data.y - posterior.prior.mean_function(train_data.X)  # account for mean
     Phi = fourier_feature_fn(train_data.X)
-    canonical_weights = solve(
-        Sigma,
-        y + eps - jnp.inner(Phi, fourier_weights),
-        solver_algorithm,
-    )  # [N, B]
+    canonical_weights = solve(Sigma, y + eps - jnp.inner(Phi, fourier_weights), solver_algorithm)  # [N, B]
 
     def sample_fn(test_inputs: Float[Array, "n D"]) -> Float[Array, "n B"]:
         fourier_features = fourier_feature_fn(test_inputs)  # [n, L]
-        weight_space_contribution = jnp.inner(
-            fourier_features, fourier_weights
-        )  # [n, B]
-        canonical_features = posterior.prior.kernel.cross_covariance(
-            test_inputs, train_data.X
-        )  # [n, N]
-        function_space_contribution = jnp.matmul(
-            canonical_features, canonical_weights
-        )
+        weight_space_contribution = jnp.inner(fourier_features, fourier_weights)  # [n, B]
+        canonical_features = posterior.prior.kernel.cross_covariance(test_inputs, train_data.X)  # [n, N]
+        function_space_contribution = jnp.matmul(canonical_features, canonical_weights)
 
-        return (
-                posterior.prior.mean_function(test_inputs)
+        return (posterior.prior.mean_function(test_inputs)
                 + weight_space_contribution
-                + function_space_contribution
-        )
+                + function_space_contribution)
 
     return sample_fn
 
@@ -177,6 +166,10 @@ def _build_fourier_features_fn(
 
     return eval_fourier_features
 
+def _build_fourier_weights(dataset_shape, num_samples, num_features, key):
+    weights = jr.normal(key, [num_samples * 2, 2 * num_features])
+    return jnp.repeat(weights, dataset_shape // 2, axis=0)  # TODO generlise both to dims more than 2
+
 
 class MO_RFF(AbstractKernel):
     r"""Computes an approximation of the kernel using Random Fourier Features.
@@ -196,15 +189,13 @@ class MO_RFF(AbstractKernel):
 
     compute_engine: BasisFunctionComputation
 
-    def __init__(
-        self,
-        kernel0: StationaryKernel,
-        kernel1: StationaryKernel,
-        num_basis_fns: int = 50,
-        frequencies: tp.Union[Float[Array, "M D"], None] = None,
-        compute_engine: BasisFunctionComputation = BasisFunctionComputation(),
-        key: KeyArray = jr.PRNGKey(0),
-    ):
+    def __init__(self,
+                 kernel0: StationaryKernel,
+                 kernel1: StationaryKernel,
+                 num_basis_fns: int = 50,
+                 frequencies: tp.Union[Float[Array, "M D"], None] = None,
+                 compute_engine: BasisFunctionComputation = BasisFunctionComputation(),
+                 key: KeyArray = jr.PRNGKey(0)):
         r"""Initialise the RFF kernel.
 
         Args:
@@ -235,12 +226,12 @@ class MO_RFF(AbstractKernel):
             key0, key1 = jrandom.split(key)
             self.frequencies0 = Static(
                 self.kernel0.spectral_density.sample(
-                    seed=key, sample_shape=(self.num_basis_fns, n_dims)
+                    seed=key0, sample_shape=(self.num_basis_fns, n_dims)
                 )
             )
             self.frequencies1 = Static(
                 self.kernel1.spectral_density.sample(
-                    seed=key, sample_shape=(self.num_basis_fns, n_dims)
+                    seed=key1, sample_shape=(self.num_basis_fns, n_dims)
                 )
             )
         self.name = f"{self.kernel0.name} (RFF)"
@@ -277,11 +268,9 @@ class MO_RFF(AbstractKernel):
         k0_switch = ((z + 1) % 2)
         k1_switch = z
 
-        part_1 = jnp.expand_dims(k0_switch, axis=-1) * self.compute_features_otherfile(self.frequencies0, self.kernel0, x[:, :2]) * jnp.sqrt(self.kernel0.variance.value / self.num_basis_fns)
-        part_2 = jnp.expand_dims(k1_switch, axis=-1) * self.compute_features_otherfile(self.frequencies1, self.kernel1, x[:, :2]) * jnp.sqrt(self.kernel1.variance.value / self.num_basis_fns)
-        return part_1 + part_2
-        # TODO unsure the above is the most correct
-        # return self.compute_engine.compute_features(self, x)
+        part_1 = self.compute_features_otherfile(self.frequencies0, self.kernel0, x[:, :-1]) * jnp.sqrt(self.kernel0.variance.value / self.num_basis_fns)
+        part_2 = self.compute_features_otherfile(self.frequencies1, self.kernel1, x[:, :-1]) * jnp.sqrt(self.kernel1.variance.value / self.num_basis_fns)
+        return jnp.expand_dims(k0_switch, axis=-1) * part_1 + jnp.expand_dims(k1_switch, axis=-1) * part_2
 
     def compute_features_otherfile(self, kernel_frequencies, kernel: K, x: Float[Array, "N D"]) -> Float[Array, "N L"]:
         r"""Compute the features for the inputs.
@@ -353,6 +342,19 @@ def tests():
     import jax.random as jrandom
     from jax import config
 
+    def label_position(data):
+        # introduce alternating z label
+        n_points = len(data[0])
+        label = jnp.tile(jnp.array([0.0, 1.0]), n_points)
+        return jnp.vstack((jnp.repeat(data, repeats=2, axis=1), label)).T
+
+    # change vectors y -> Y by reshaping the velocity measurements
+    def stack_velocity(data):
+        return data.T.flatten().reshape(-1, 1)
+
+    def dataset_3d(pos, vel):
+        return gpjax.Dataset(label_position(pos), stack_velocity(vel))
+
     main_key = jrandom.key(42)
 
     config.update("jax_enable_x64", True)
@@ -382,12 +384,16 @@ def tests():
         likelihood = gpjax.likelihoods.Gaussian(data.n)
         posterior = ind_prior * likelihood
         # key, _key = jrandom.split(key)
-        sample_func = posterior.sample_approx(num_samples=1, train_data=data, key=main_key, num_features=5)
+        sample_func = posterior.sample_approx(num_samples=1, train_data=data, key=main_key, num_features=3)
         new_vals.append(sample_func(test_data.X))
 
     posterior_mo = prior_mo * gpjax.likelihoods.Gaussian(train_data_mo.n)
-    sample_func_mo = adj_sample_approx(posterior_mo, num_samples=1, train_data=train_data_mo, key=main_key, num_features=5)
+    sample_func_mo = adj_sample_approx(posterior_mo, num_samples=1, train_data=train_data_mo, key=main_key, num_features=3)
     new_vals_mo = sample_func_mo(test_data_mo.X)
+    # latent = posterior_mo.predict(test_data_mo.X, train_data=train_data_mo)
+    # latent_mean = latent.mean()
+
+    # new_data = dataset_3d(test_data.X, latent_mean)
 
     print(jnp.concatenate((new_vals[0], new_vals[1]), axis=-1))
     print(jnp.swapaxes(new_vals_mo, 0, 1))

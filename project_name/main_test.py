@@ -300,7 +300,7 @@ def sample_and_optimize_posterior(optimized_posterior, D, key, lower_bound, uppe
     def outer_loop(init_x, dataset_x, dataset_y, key):
         dataset = gpjax.Dataset(dataset_x, dataset_y)
         main_key, _key = jrandom.split(key)
-        sample_func = posterior.sample_approx(num_samples=1, train_data=dataset, key=_key, num_features=500)
+        # sample_func = posterior.sample_approx(num_samples=1, train_data=dataset, key=_key, num_features=500)
         sample_func = adj_sample_approx(posterior, num_samples=1, train_data=dataset, key=_key, num_features=500)
 
         def _step_fn(runner_state, _):
