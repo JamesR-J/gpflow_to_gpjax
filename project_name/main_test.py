@@ -228,6 +228,7 @@ class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed 
         # kernel1: gpjax.kernels.AbstractKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
         kernel0: gpjax.kernels.stationary.StationaryKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
         kernel1: gpjax.kernels.stationary.StationaryKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
+        # kernel1: gpjax.kernels.stationary.StationaryKernel = gpjax.kernels.Matern32(),
     ):
         self.kernel0 = kernel0
         self.kernel1 = kernel1

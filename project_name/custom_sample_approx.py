@@ -48,6 +48,7 @@ from gpjax.typing import (
     Array,
     KeyArray,
 )
+import jax.random as jrandom
 
 K = tp.TypeVar("K", bound=AbstractKernel)
 M = tp.TypeVar("M", bound=AbstractMeanFunction)
@@ -231,7 +232,7 @@ class MO_RFF(AbstractKernel):
                     "Expected the number of dimensions to be specified for the base kernel. "
                     "Please specify the n_dims argument for the base kernel."
                 )
-
+            key0, key1 = jrandom.split(key)
             self.frequencies0 = Static(
                 self.kernel0.spectral_density.sample(
                     seed=key, sample_shape=(self.num_basis_fns, n_dims)
@@ -297,3 +298,102 @@ class MO_RFF(AbstractKernel):
         z = jnp.matmul(x, (frequencies / scaling_factor).T)
         z = jnp.concatenate([jnp.cos(z), jnp.sin(z)], axis=-1)
         return z
+
+def adjust_dataset(x, y):
+    # Change vectors x -> X = (x,z), and vectors y -> Y = (y,z) via the artificial z label
+    def label_position(data):  # 2,20
+        # introduce alternating z label
+        n_points = len(data[0])
+        label = jnp.tile(jnp.array([0.0, 1.0]), n_points)
+        return jnp.vstack((jnp.repeat(data, repeats=2, axis=1), label)).T
+
+    # change vectors y -> Y by reshaping the velocity measurements
+    def stack_velocity(data):  # 2,20
+        return data.T.flatten().reshape(-1, 1)
+
+    def dataset_3d(pos, vel):
+        return gpjax.Dataset(label_position(pos), stack_velocity(vel))
+
+    # takes in dimension (number of data points, num features)
+
+    return dataset_3d(jnp.swapaxes(x, 0, 1), jnp.swapaxes(y, 0, 1))
+
+import gpjax
+from gpjax.kernels.computations import DenseKernelComputation
+
+class VelocityKernel(gpjax.kernels.stationary.StationaryKernel):  #TODO changed this from abstract kernel
+    def __init__(
+        self,
+        # kernel0: gpjax.kernels.AbstractKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),  # TODO the original with abstract kernels
+        # kernel1: gpjax.kernels.AbstractKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
+        kernel0: gpjax.kernels.stationary.StationaryKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
+        kernel1: gpjax.kernels.stationary.StationaryKernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0),
+        # kernel1: gpjax.kernels.stationary.StationaryKernel = gpjax.kernels.Matern32(),
+    ):
+        self.kernel0 = kernel0
+        self.kernel1 = kernel1
+        super().__init__(n_dims=3, compute_engine=DenseKernelComputation())
+
+    def __call__(
+        self, X: Float[Array, "1 D"], Xp: Float[Array, "1 D"]) -> Float[Array, "1"]:
+        # standard RBF-SE kernel is x and x' are on the same output, otherwise returns 0
+
+        z = jnp.array(X[-1], dtype=int)
+        zp = jnp.array(Xp[-1], dtype=int)
+
+        # achieve the correct value via 'switches' that are either 1 or 0
+        k0_switch = ((z + 1) % 2) * ((zp + 1) % 2)
+        k1_switch = z * zp
+
+        return k0_switch * self.kernel0(X, Xp) + k1_switch * self.kernel1(X, Xp)
+
+
+def tests():
+    import gpjax
+    import jax.random as jrandom
+    from jax import config
+
+    main_key = jrandom.key(42)
+
+    config.update("jax_enable_x64", True)
+
+    mean_func = gpjax.mean_functions.Zero()
+
+    kernel_mo = VelocityKernel()
+    prior_mo = gpjax.gps.Prior(mean_function=mean_func,  kernel=kernel_mo)
+
+    kernel = gpjax.kernels.RBF(active_dims=[0, 1], lengthscale=jnp.array([10.0, 8.0]), variance=25.0)
+    prior_ind = gpjax.gps.Prior(mean_function=mean_func, kernel=kernel)
+    prior = [prior_ind for _ in range(2)]
+
+    # so data is of shape x,2 and we copy for x and then we split y into indivudal gps, basically buffer the dataset
+
+    num_data = 4
+    train_data = gpjax.Dataset(jnp.arange(0, num_data, 1, dtype=jnp.float64).reshape(-1, 2), jnp.arange(num_data, num_data*2, 1, dtype=jnp.float64).reshape(-1, 2))
+    train_data_mo = adjust_dataset(train_data.X, train_data.y)
+
+    test_data = gpjax.Dataset(jnp.arange(num_data * 2, num_data * 3 - (num_data / 2), 1, dtype=jnp.float64).reshape(-1, 2), jnp.arange(num_data * 2, num_data * 3 - (num_data / 2), 1, dtype=jnp.float64).reshape(-1, 2))
+    test_data_mo = adjust_dataset(test_data.X, test_data.y)
+
+    new_vals = []
+    key = main_key.copy()
+    for gp_idx, ind_prior in enumerate(prior):
+        data = gpjax.Dataset(X=train_data.X, y=jnp.expand_dims(train_data.y[:, gp_idx], axis=-1))
+        likelihood = gpjax.likelihoods.Gaussian(data.n)
+        posterior = ind_prior * likelihood
+        # key, _key = jrandom.split(key)
+        sample_func = posterior.sample_approx(num_samples=1, train_data=data, key=main_key, num_features=5)
+        new_vals.append(sample_func(test_data.X))
+
+    posterior_mo = prior_mo * gpjax.likelihoods.Gaussian(train_data_mo.n)
+    sample_func_mo = adj_sample_approx(posterior_mo, num_samples=1, train_data=train_data_mo, key=main_key, num_features=5)
+    new_vals_mo = sample_func_mo(test_data_mo.X)
+
+    print(jnp.concatenate((new_vals[0], new_vals[1]), axis=-1))
+    print(jnp.swapaxes(new_vals_mo, 0, 1))
+
+    return
+
+
+if __name__ == "__main__":
+    tests()
